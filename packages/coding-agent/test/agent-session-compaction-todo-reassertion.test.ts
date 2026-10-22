@@ -3,7 +3,6 @@ import * as path from "node:path";
 import { type } from "@oh-my-pi/omptype";
 import { Agent, type AgentMessage, type AgentTool } from "@oh-my-pi/pi-agent-core";
 import * as compactionModule from "@oh-my-pi/pi-agent-core/compaction";
-import type { TextContent } from "@oh-my-pi/pi-ai";
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
@@ -18,14 +17,24 @@ import { TempDir } from "@oh-my-pi/pi-utils";
 // Post-compaction todo reassertion (#16738): when a todo list survives compaction, the
 // eager prelude path stays silent by design (it bails once phases exist), so the
 // auto-continuation turn must carry a reminder-only reassertion of the surviving
-// list — compaction summarized away the `todo` tool results that created it.
+// list — compaction summarized away the `todo` tool results that created it. The
+// reassertion renders the full canonical state (statuses and blocker notes included)
+// and is skipped when the latest todo snapshot still lies inside the kept tail, where
+// the model already sees it.
+//
+// The goal-mode auto-continuation prompt already carries a `<todo_context>` block
+// (bracket-first, no blocker notes), so these tests assert on the canonical render
+// shape of the reassertion — `<content> [<status>]` / `[blocked: <note>]` — which only
+// the post-compaction reassertion produces. Custom nudge messages are also normalized
+// into the context before they reach the provider stream, so message roles are not
+// asserted.
 
-const REASSERTION_MARKER = "canonical state";
+const AUTO_CONTINUE_MARKER = "Resume the user's latest intent";
 
 type ObservedPromptCall = {
 	callIndex: number;
 	toolChoice: string | undefined;
-	messageTexts: string[];
+	text: string;
 };
 
 type WaitForCall = (predicate: (call: ObservedPromptCall) => boolean) => Promise<ObservedPromptCall>;
@@ -37,11 +46,6 @@ type Harness = {
 	waitForCall: WaitForCall;
 };
 
-function isTextContentBlock(value: unknown): value is TextContent {
-	if (!value || typeof value !== "object") return false;
-	return (value as TextContent).type === "text" && typeof (value as TextContent).text === "string";
-}
-
 function getToolChoiceName(choice: unknown): string | undefined {
 	if (!choice) return undefined;
 	if (typeof choice === "string") return choice;
@@ -50,6 +54,15 @@ function getToolChoiceName(choice: unknown): string | undefined {
 	if (toolChoice.type === "tool") return toolChoice.name;
 	if (toolChoice.type === "function") return toolChoice.name ?? toolChoice.function?.name;
 	return undefined;
+}
+
+function isTextContentBlock(value: unknown): value is { type: "text"; text: string } {
+	return (
+		typeof value === "object" &&
+		value !== null &&
+		(value as { type?: unknown }).type === "text" &&
+		typeof (value as { text?: unknown }).text === "string"
+	);
 }
 
 function getMessageText(message: AgentMessage): string {
@@ -171,6 +184,13 @@ describe("AgentSession post-compaction todo reassertion", () => {
 		});
 		const sessionManager = SessionManager.inMemory(tempDir.path());
 
+		const mockTaskTool: AgentTool = {
+			name: "task",
+			label: "Task",
+			description: "Mock task tool",
+			parameters: type({}),
+			execute: async () => ({ content: [{ type: "text" as const, text: "ok" }] }),
+		};
 		const mockBashTool: AgentTool = {
 			name: "bash",
 			label: "Bash",
@@ -186,7 +206,7 @@ describe("AgentSession post-compaction todo reassertion", () => {
 			settings,
 		};
 		const todoTool = new TodoTool(toolSession);
-		const tools: AgentTool[] = [todoTool as unknown as AgentTool, mockBashTool];
+		const tools: AgentTool[] = [todoTool as unknown as AgentTool, mockTaskTool, mockBashTool];
 
 		const agent = new Agent({
 			getApiKey: () => "test-key",
@@ -197,7 +217,7 @@ describe("AgentSession post-compaction todo reassertion", () => {
 				const call: ObservedPromptCall = {
 					callIndex: observedCalls.length,
 					toolChoice: getToolChoiceName(options?.toolChoice),
-					messageTexts: context.messages.map(message => getMessageText(message)),
+					text: context.messages.map(message => getMessageText(message)).join("\n"),
 				};
 				observedCalls.push(call);
 				for (let i = waiters.length - 1; i >= 0; i--) {
@@ -218,6 +238,7 @@ describe("AgentSession post-compaction todo reassertion", () => {
 		});
 
 		const toolRegistry = new Map<string, AgentTool>([
+			[mockTaskTool.name, mockTaskTool],
 			[mockBashTool.name, mockBashTool],
 			[todoTool.name, todoTool as unknown as AgentTool],
 		]);
@@ -259,53 +280,69 @@ describe("AgentSession post-compaction todo reassertion", () => {
 		});
 	}
 
-	/** Run the first prompt, add a surviving todo entry, drive a compaction, resolve with the continuation call. */
+	/**
+	 * Run the first prompt, add a todo entry that gets summarized away (the keep
+	 * boundary lands on a later marker entry), drive a compaction, and resolve with
+	 * the compaction auto-continuation provider call (identified by the
+	 * auto-continue template marker, distinct from a todo reminder turn).
+	 */
 	async function runToContinuationWithTodos(
 		session: AgentSession,
 		sessionManager: SessionManager,
 		waitForCall: WaitForCall,
-		phases: { name: string; tasks: { content: string; status: string }[] }[],
+		phases: { name: string; tasks: { content: string; status: string; blocker?: string }[] }[],
 	): Promise<ObservedPromptCall> {
-		await session.prompt("refactor the parser across modules");
 		activateOngoingGoal(session);
+		await session.prompt("refactor the parser across modules");
 		const todoEntryId = sessionManager.appendCustomEntry(USER_TODO_EDIT_CUSTOM_TYPE, { phases });
-		stubCompaction(todoEntryId);
-		const continuationPromise = waitForCall(call => call.callIndex > 0);
+		// The keep boundary starts after the todo entry: the snapshot is summarized away.
+		const boundaryEntryId = sessionManager.appendCustomEntry("compaction-boundary-marker", {});
+		stubCompaction(boundaryEntryId);
+		const continuationPromise = waitForCall(call => call.callIndex > 0 && call.text.includes(AUTO_CONTINUE_MARKER));
 		emitHighUsageTurn(session);
 		return continuationPromise;
 	}
 
-	it("reasserts a surviving todo list on the auto-continuation turn", async () => {
-		const { session, sessionManager, waitForCall } = await createHarness();
-		const continuation = await runToContinuationWithTodos(session, sessionManager, waitForCall, [
-			{ name: "Work", tasks: [{ content: "do the thing", status: "pending" }] },
-		]);
-
-		const reassertion = continuation.messageTexts.find(text => text.includes(REASSERTION_MARKER));
-		expect(reassertion).toBeDefined();
-		expect(reassertion).toContain("do the thing");
-		expect(reassertion).toContain("1 item(s) are still open");
-		// Reminder-only: never a forced tool_choice on the resumed turn.
-		expect(continuation.toolChoice).toBeUndefined();
-	});
-
-	it("lists only incomplete tasks in the reassertion", async () => {
+	it("reasserts the surviving todo list with the full canonical state", async () => {
 		const { session, sessionManager, waitForCall } = await createHarness();
 		const continuation = await runToContinuationWithTodos(session, sessionManager, waitForCall, [
 			{
 				name: "Work",
 				tasks: [
+					{ content: "do the thing", status: "pending" },
+					{ content: "finish the parser", status: "in_progress" },
+					{ content: "awaiting review", status: "pending", blocker: "reviewer feedback" },
 					{ content: "done thing", status: "completed" },
-					{ content: "pending thing", status: "pending" },
 				],
 			},
 		]);
 
-		const reassertion = continuation.messageTexts.find(text => text.includes(REASSERTION_MARKER));
-		expect(reassertion).toBeDefined();
-		expect(reassertion).toContain("pending thing");
-		expect(reassertion).not.toContain("done thing");
-		expect(reassertion).toContain("1 item(s) are still open");
+		// Canonical render shape: status/blocker markers trail the task content, and
+		// blocked tasks keep their blocker note — none of which the goal-mode
+		// <todo_context> block produces.
+		expect(continuation.text).toContain("- awaiting review [blocked: reviewer feedback]");
+		expect(continuation.text).toContain("- finish the parser [in_progress]");
+		expect(continuation.text).toContain("- done thing [completed]");
+		// Reminder-only: never a forced tool_choice on the resumed turn.
+		expect(continuation.toolChoice).toBeUndefined();
+	});
+
+	it("does not reassert when the latest todo snapshot is still inside the kept tail", async () => {
+		const { session, sessionManager, waitForCall } = await createHarness();
+		activateOngoingGoal(session);
+		await session.prompt("refactor the parser across modules");
+		// Keep boundary starts at the todo entry itself: the model still sees the snapshot.
+		const todoEntryId = sessionManager.appendCustomEntry(USER_TODO_EDIT_CUSTOM_TYPE, {
+			phases: [{ name: "Work", tasks: [{ content: "done thing", status: "completed" }] }],
+		});
+		stubCompaction(todoEntryId);
+		const continuationPromise = waitForCall(call => call.callIndex > 0 && call.text.includes(AUTO_CONTINUE_MARKER));
+		emitHighUsageTurn(session);
+		const continuation = await continuationPromise;
+
+		// The snapshot is visible in the kept tail, so the canonical reassertion
+		// (content-then-marker shape) must not fire.
+		expect(continuation.text).not.toContain("- done thing [completed]");
 	});
 
 	it("does not reassert when no todo list exists", async () => {
@@ -313,20 +350,29 @@ describe("AgentSession post-compaction todo reassertion", () => {
 		activateOngoingGoal(session);
 		await session.prompt("refactor the parser across modules");
 		stubCompaction();
-		const continuationPromise = waitForCall(call => call.callIndex > 0);
+		const continuationPromise = waitForCall(call => call.callIndex > 0 && call.text.includes(AUTO_CONTINUE_MARKER));
 		emitHighUsageTurn(session);
 		const continuation = await continuationPromise;
 
-		expect(continuation.messageTexts.some(text => text.includes(REASSERTION_MARKER))).toBe(false);
+		expect(continuation.text).not.toContain("[completed]");
+		expect(continuation.text).not.toContain("[in_progress]");
+		expect(continuation.text).not.toContain("[blocked:");
 	});
 
 	it("does not reassert when todo.reminders is disabled", async () => {
 		const { session, sessionManager, waitForCall } = await createHarness({ "todo.reminders": false });
 		const continuation = await runToContinuationWithTodos(session, sessionManager, waitForCall, [
-			{ name: "Work", tasks: [{ content: "do the thing", status: "pending" }] },
+			{
+				name: "Work",
+				tasks: [
+					{ content: "finish the parser", status: "in_progress" },
+					{ content: "done thing", status: "completed" },
+				],
+			},
 		]);
 
-		expect(continuation.messageTexts.some(text => text.includes(REASSERTION_MARKER))).toBe(false);
+		expect(continuation.text).not.toContain("- finish the parser [in_progress]");
+		expect(continuation.text).not.toContain("- done thing [completed]");
 	});
 
 	it("does not reassert when every task is complete", async () => {
@@ -335,16 +381,23 @@ describe("AgentSession post-compaction todo reassertion", () => {
 			{ name: "Work", tasks: [{ content: "done thing", status: "completed" }] },
 		]);
 
-		expect(continuation.messageTexts.some(text => text.includes(REASSERTION_MARKER))).toBe(false);
+		expect(continuation.text).not.toContain("- done thing [completed]");
 	});
 
 	it("does not reassert in plan mode", async () => {
 		const { session, sessionManager, waitForCall } = await createHarness();
+		activateOngoingGoal(session);
+		await session.prompt("refactor the parser across modules");
 		session.setPlanModeState({ enabled: true, planFilePath: path.join(tempDir.path(), "plan.md") });
-		const continuation = await runToContinuationWithTodos(session, sessionManager, waitForCall, [
-			{ name: "Work", tasks: [{ content: "do the thing", status: "pending" }] },
-		]);
+		const todoEntryId = sessionManager.appendCustomEntry(USER_TODO_EDIT_CUSTOM_TYPE, {
+			phases: [{ name: "Work", tasks: [{ content: "finish the parser", status: "in_progress" }] }],
+		});
+		const boundaryEntryId = sessionManager.appendCustomEntry("compaction-boundary-marker", {});
+		stubCompaction(boundaryEntryId);
+		const continuationPromise = waitForCall(call => call.callIndex > 0 && call.text.includes(AUTO_CONTINUE_MARKER));
+		emitHighUsageTurn(session);
+		const continuation = await continuationPromise;
 
-		expect(continuation.messageTexts.some(text => text.includes(REASSERTION_MARKER))).toBe(false);
+		expect(continuation.text).not.toContain("- finish the parser [in_progress]");
 	});
 });

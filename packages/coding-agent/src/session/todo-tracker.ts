@@ -6,7 +6,9 @@ import eagerTaskPrompt from "../prompts/system/eager-task.md" with { type: "text
 import eagerTodoPrompt from "../prompts/system/eager-todo.md" with { type: "text" };
 import midRunTodoNudgePrompt from "../prompts/system/mid-run-todo-nudge.md" with { type: "text" };
 import postCompactionTodoPrompt from "../prompts/system/post-compaction-todo.md" with { type: "text" };
-import { getLatestTodoPhasesFromEntries, isTodoPhase } from "../tools/todo";
+import { getLatestTodoPhasesFromEntries, getLatestTodoSnapshotIdentity, isTodoPhase } from "../tools/todo";
+import { getLatestCompactionEntry } from "./session-context";
+import type { SessionEntry } from "../session/session-entries";
 import { type TodoItem, type TodoPhase } from "@oh-my-pi/pi-tui/tools/todo";
 import { buildNamedToolChoice } from "../utils/tool-choice";
 import type { AgentSessionEvent } from "./agent-session-events";
@@ -78,6 +80,52 @@ interface IncompletePhase {
 function formatTodoList(incompleteByPhase: IncompletePhase[]): string {
 	return incompleteByPhase
 		.map(phase => `- ${phase.name}\n${phase.tasks.map(task => `  - ${task.content}`).join("\n")}`)
+		.join("\n");
+}
+
+/**
+ * True when the latest todo snapshot's entry sits at or after the compaction keep
+ * boundary — i.e. the snapshot survives in the kept tail the model still sees, so a
+ * reassertion would be redundant.
+ */
+function snapshotKeptAfterCompaction(
+	entries: SessionEntry[],
+	firstKeptEntryId: string,
+	snapshotEntryId: string,
+): boolean {
+	let boundaryIndex = -1;
+	let snapshotIndex = -1;
+	for (let index = 0; index < entries.length; index++) {
+		const id = entries[index]?.id;
+		if (id === firstKeptEntryId && boundaryIndex < 0) boundaryIndex = index;
+		if (id === snapshotEntryId) snapshotIndex = index;
+	}
+	return boundaryIndex >= 0 && snapshotIndex >= boundaryIndex;
+}
+
+/**
+ * Renders the full canonical todo list for the post-compaction reassertion: every
+ * task keeps its status, and blocked tasks carry their blocker note, so the resumed
+ * turn has the complete state and does not re-`init` from a subset.
+ */
+function formatCanonicalTodoList(phases: TodoPhase[]): string {
+	return phases
+		.map(phase => {
+			const tasks = phase.tasks
+				.map(task => {
+					const marker =
+						task.status === "completed"
+							? " [completed]"
+							: task.status === "in_progress"
+								? " [in_progress]"
+								: task.blocker !== undefined
+									? ` [blocked: ${task.blocker}]`
+									: "";
+					return `  - ${task.content}${marker}`;
+				})
+				.join("\n");
+			return `- ${phase.name}\n${tasks}`;
+		})
 		.join("\n");
 }
 
@@ -248,7 +296,11 @@ export class TodoTracker {
 	 * post-compaction auto-continuation turn. Unlike {@link createEagerTodoPrelude}
 	 * (gated on `todo.eager`, and deliberately silent once a list exists), this
 	 * nudge fires exactly then: compaction summarized away the `todo` tool results
-	 * that created the list, so the resumed turn no longer sees it (#16738).
+	 * that created the list, so the resumed turn no longer sees it (#16738). It
+	 * stays silent when the latest todo snapshot is still inside the kept tail
+	 * (the model already sees it) and renders the full list — blocked tasks with
+	 * their blocker note, completed tasks included — so the model does not
+	 * re-`init` from a subset and drop work (#16753 review).
 	 */
 	buildPostCompactionTodoReassertion(): AgentMessage | undefined {
 		if (!cfgTodoEnabled.get(this.#host.settings) || !cfgTodoReminders.get(this.#host.settings)) {
@@ -257,17 +309,25 @@ export class TodoTracker {
 		if (this.#host.planModeEnabled() || !this.#host.getActiveToolNames().includes("todo")) {
 			return undefined;
 		}
-		const incompleteByPhase = this.#incompleteByPhase();
-		if (incompleteByPhase.length === 0) return undefined;
-		const incomplete = incompleteByPhase.flatMap(phase => phase.tasks);
+		const branch = this.#host.sessionManager.getBranch();
+		const compaction = getLatestCompactionEntry(branch);
+		const snapshot = getLatestTodoSnapshotIdentity(branch);
+		if (
+			compaction &&
+			snapshot &&
+			snapshotKeptAfterCompaction(branch, compaction.firstKeptEntryId, snapshot.sourceEntryId)
+		) {
+			return undefined;
+		}
+		const incomplete = this.#incompleteByPhase().flatMap(phase => phase.tasks);
+		if (incomplete.length === 0) return undefined;
 		const { toolRefs } = this.#buildEagerPreludeContext();
 		return {
 			role: "custom",
 			customType: POST_COMPACTION_TODO_MESSAGE_TYPE,
 			content: prompt.render(postCompactionTodoPrompt, {
 				toolRefs,
-				incompleteCount: incomplete.length,
-				todoList: formatTodoList(incompleteByPhase),
+				todoList: formatCanonicalTodoList(this.#phases),
 			}),
 			display: false,
 			attribution: "agent",
