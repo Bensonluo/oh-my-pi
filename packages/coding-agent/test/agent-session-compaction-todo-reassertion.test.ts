@@ -294,7 +294,7 @@ describe("AgentSession post-compaction todo reassertion", () => {
 	): Promise<ObservedPromptCall> {
 		activateOngoingGoal(session);
 		await session.prompt("refactor the parser across modules");
-		const todoEntryId = sessionManager.appendCustomEntry(USER_TODO_EDIT_CUSTOM_TYPE, { phases });
+		sessionManager.appendCustomEntry(USER_TODO_EDIT_CUSTOM_TYPE, { phases });
 		// The keep boundary starts after the todo entry: the snapshot is summarized away.
 		const boundaryEntryId = sessionManager.appendCustomEntry("compaction-boundary-marker", {});
 		stubCompaction(boundaryEntryId);
@@ -389,7 +389,7 @@ describe("AgentSession post-compaction todo reassertion", () => {
 		activateOngoingGoal(session);
 		await session.prompt("refactor the parser across modules");
 		session.setPlanModeState({ enabled: true, planFilePath: path.join(tempDir.path(), "plan.md") });
-		const todoEntryId = sessionManager.appendCustomEntry(USER_TODO_EDIT_CUSTOM_TYPE, {
+		sessionManager.appendCustomEntry(USER_TODO_EDIT_CUSTOM_TYPE, {
 			phases: [{ name: "Work", tasks: [{ content: "finish the parser", status: "in_progress" }] }],
 		});
 		const boundaryEntryId = sessionManager.appendCustomEntry("compaction-boundary-marker", {});
