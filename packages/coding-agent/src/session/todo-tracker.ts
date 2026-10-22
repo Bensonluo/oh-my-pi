@@ -30,7 +30,7 @@ const MID_RUN_NUDGE_MESSAGE_TYPE = "mid-run-todo-nudge";
 /** Message type of the hidden first-turn reminder {@link TodoTracker.createEagerTodoPrelude} builds. */
 export const EAGER_TODO_PRELUDE_MESSAGE_TYPE = "eager-todo-prelude";
 /** Message type of the reminder-only todo reassertion {@link TodoTracker.buildPostCompactionTodoReassertion} builds. */
-export const POST_COMPACTION_TODO_MESSAGE_TYPE = "post-compaction-todo";
+const POST_COMPACTION_TODO_MESSAGE_TYPE = "post-compaction-todo";
 const MARKDOWN_PROMPT_PREFIX_RE = /^(?:>\s*)?(?:(?:[-*+]|\d+[.)])\s+)*/;
 const PROMPT_LABEL_RE = /^(?:q(?:uestion)?|ask)\s*\d*\s*[:.)-]\s*/i;
 const INLINE_EMPHASIS_RE = /(\*\*|__)(.*?)\1/g;
