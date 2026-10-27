@@ -83,6 +83,7 @@ import {
 	getImplicitOllamaBaseUrl,
 	getOllamaContextLengthOverride,
 	isDiscoveryAuthRejection,
+	LLAMA_CPP_DEFAULT_BASE_URLS,
 	normalizeBareDiscoveryBaseUrl,
 	normalizeLiteLLMDiscoveryBaseUrl,
 	normalizeLlamaCppBaseUrl,
@@ -1660,9 +1661,10 @@ export class ModelRegistry {
 			this.#discoverableProviders.push({
 				provider: "llama.cpp",
 				api: "openai-responses",
-				baseUrl: Bun.env.LLAMA_CPP_BASE_URL || "http://127.0.0.1:8080",
+				baseUrl: Bun.env.LLAMA_CPP_BASE_URL || LLAMA_CPP_DEFAULT_BASE_URLS[0],
 				discovery: { type: "llama.cpp" },
 				optional: !Bun.env.LLAMA_CPP_BASE_URL,
+				fallbackBaseUrls: Bun.env.LLAMA_CPP_BASE_URL ? undefined : LLAMA_CPP_DEFAULT_BASE_URLS.slice(1),
 			});
 			// Only mark as keyless if no API key is configured
 			if (this.authStorage.keys.source("llama.cpp") === undefined) {
@@ -2015,10 +2017,11 @@ export class ModelRegistry {
 				: `${providerConfig.provider}:openai-models-list-context-v4`;
 		}
 		if (providerConfig.discovery.type === "litellm") {
-			// rich-v5 invalidates rows written before discovery filtered known
+			// rich-v6 invalidates rows written before `mode: decisions` groups moved
+			// to the Decisions runner; rich-v5 before discovery filtered known
 			// non-conversational modes. Keep this in lockstep with the catalog
 			// package's `litellm:rich-vN` namespace whenever mapping behavior changes.
-			return `${providerConfig.provider}:litellm-rich-v5`;
+			return `${providerConfig.provider}:litellm-rich-v6`;
 		}
 		return providerConfig.provider;
 	}
@@ -2329,6 +2332,7 @@ export class ModelRegistry {
 								accounts?.map(account => ({
 									accessToken: account.accessToken,
 									accountKey: oauthAccountKey(account),
+									projectId: account.projectId,
 								})) ?? null
 							);
 						},

@@ -74,7 +74,10 @@ import { formatExtensionLoadNotifications } from "./extensibility/extensions/loa
 import { loadExtensions } from "./extensibility/extensions/loader";
 import { ExtensionRunner } from "./extensibility/extensions/runner";
 import type { ExtensionUIContext } from "./extensibility/extensions/types";
-import { scheduleMarketplaceAutoUpdate } from "./extensibility/plugins/marketplace-auto-update";
+import {
+	scheduleMarketplaceAutoUpdate,
+	type MarketplaceAutoUpdateOptions,
+} from "./extensibility/plugins/marketplace-auto-update";
 import { registerDaemonProjectPresence } from "./launch/presence";
 import type { MCPManager } from "./mcp";
 import type { InteractiveMode } from "./modes/interactive-mode";
@@ -146,7 +149,7 @@ import { cfgGoalEnabled } from "./goals/settings";
 import { cfgPlanDefaultOnStartup, cfgPlanEnabled } from "./plan-mode/settings";
 
 import { cfgAdvisorEnabled } from "./advisor/settings";
-import { cfgToolsApprovalMode } from "./tools/settings";
+import { cfgAsyncPrintWake, cfgToolsApprovalMode } from "./tools/settings";
 import {
 	cfgAutocompleteMaxVisible,
 	cfgAutoResume,
@@ -179,6 +182,8 @@ import {
 	cfgHideThinkingBlock,
 	cfgOmitThinking,
 	cfgPrewalkEnabled,
+	cfgSessionMaxCost,
+	cfgSessionWarnCost,
 } from "./session/settings";
 import { cfgDisabledProviders, cfgEnabledModels } from "./config/model-settings";
 import { cfgTaskAgentIdleTtlMs } from "./task/settings";
@@ -402,7 +407,7 @@ export async function submitInteractiveInput(
 		| "optimisticSkillMessagePending"
 	> &
 		Partial<Pick<InteractiveMode, "loopPrompt" | "pauseLoop">>,
-	session: Pick<AgentSession, "prompt" | "promptCustomMessage" | "isStreaming">,
+	session: Pick<AgentSession, "buildUserSkillPrompt" | "prompt" | "promptCustomMessage" | "isStreaming">,
 	input: SubmittedUserInput,
 ): Promise<void> {
 	if (input.cancelled) {
@@ -1719,6 +1724,11 @@ export async function buildSessionOptions(
 		options.rules = [];
 	}
 
+	// Context files
+	if (parsed.noContextFiles) {
+		options.noContextFiles = true;
+	}
+
 	// Trusted extension paths are an exact allowlist for extension modules.
 	if (parsed.trustedExtensions && parsed.trustedExtensions.length > 0) {
 		const trustedPaths = parsed.trustedExtensions.map(trustedPath => {
@@ -1935,6 +1945,9 @@ export async function runRootCommand(
 			// setup-time checks (e.g. #wrapToolForAcpPermission) also see the yolo intent.
 			cfgToolsApprovalMode.override(settingsInstance, "yolo");
 		}
+		// Runtime overrides (not persisted): the session's cost gate reads its thresholds from settings.
+		if (parsedArgs.warnCost !== undefined) cfgSessionWarnCost.override(settingsInstance, parsedArgs.warnCost);
+		if (parsedArgs.maxCost !== undefined) cfgSessionMaxCost.override(settingsInstance, parsedArgs.maxCost);
 		if (parsedArgs.mode === "rpc" || parsedArgs.mode === "rpc-ui") {
 			applyProtocolDefaults("rpc", settingsInstance);
 		} else if (parsedArgs.mode === "acp") {
@@ -2000,6 +2013,10 @@ export async function runRootCommand(
 		// Apply --advisor CLI flag (ephemeral, not persisted)
 		if (parsedArgs.advisor) {
 			cfgAdvisorEnabled.override(settingsInstance, true);
+		}
+		// Apply --wait-async CLI flag (ephemeral, not persisted); only print mode reads it
+		if (parsedArgs.waitAsync) {
+			cfgAsyncPrintWake.override(settingsInstance, true);
 		}
 		// Apply --external-thinking CLI flag (ephemeral, not persisted)
 		if (parsedArgs.externalThinking) {
@@ -2259,12 +2276,6 @@ export async function runRootCommand(
 				: undefined;
 		daemonPresencePromise?.catch(() => {});
 
-		scheduleMarketplaceAutoUpdate({
-			autoUpdate: cfgMarketplaceAutoUpdate.get(settingsInstance),
-			resolveActiveProjectRegistryPath,
-			clearPluginRootsCache: clearPluginRootsAndCaches,
-		});
-
 		const sessionOptions = await logger.time(
 			"buildSessionOptions",
 			buildSessionOptions,
@@ -2274,6 +2285,11 @@ export async function runRootCommand(
 			modelRegistry,
 			settingsInstance,
 		);
+		const marketplaceAutoUpdateOptions: MarketplaceAutoUpdateOptions = {
+			autoUpdate: cfgMarketplaceAutoUpdate.get(settingsInstance),
+			resolveActiveProjectRegistryPath,
+			clearPluginRootsCache: clearPluginRootsAndCaches,
+		};
 		sessionOptions.authStorage = authStorage;
 		sessionOptions.modelRegistry = modelRegistry;
 		sessionOptions.hasUI = isInteractive || mode === "rpc-ui";
@@ -2357,6 +2373,7 @@ export async function runRootCommand(
 			});
 			// Branch-only protocol runner: keep ACP server code out of normal interactive startup.
 			const runAcpMode = deps.runAcpMode ?? (await import("./modes/acp/acp-mode")).runAcpMode;
+			scheduleMarketplaceAutoUpdate(marketplaceAutoUpdateOptions);
 			stopStartupWatchdog();
 			// Startup is over: stop recording spans, or every later session and subagent
 			// appends to the timing tree for the life of the server.
@@ -2534,6 +2551,7 @@ export async function runRootCommand(
 				}
 				throw error;
 			}
+			scheduleMarketplaceAutoUpdate(marketplaceAutoUpdateOptions);
 
 			// Cold-revive support: a `parked` subagent ref restored from disk (Agent Hub
 			// scan, collab mirror, resumed process) has a sessionFile but no in-memory
@@ -2739,6 +2757,7 @@ export async function runRootCommand(
 					printThoughts: initialArgs.printThoughts,
 					planYolo: parsedArgs.planYolo,
 					mcpManager,
+					deadline: sessionOptions.deadline,
 				});
 				if ($env.PI_TIMING) {
 					logger.printTimings();

@@ -28,7 +28,13 @@ import sessionAgentNoticePrompt from "../prompts/system/session-agent-notice.md"
 import toolRosterNoticePrompt from "../prompts/system/tool-roster-notice.md" with { type: "text" };
 import xdevMountNoticePrompt from "../prompts/system/xdev-mount-notice.md" with { type: "text" };
 import { isMCPToolName, normalizeToolNames } from "../tools/builtin-names";
-import { denyError, resolveApproval, resolveApprovalFromContext } from "../tools/approval";
+import {
+	approvalRestrictions,
+	denyError,
+	resolveApproval,
+	resolveApprovalFromContext,
+	restrictedFolderReason,
+} from "../tools/approval";
 import { getApprovalGrants } from "../tools/approval-cache";
 import { wrapToolWithMetaNotice } from "../tools/output-meta";
 import { isFilesystemSourcePath } from "../tools/path-utils";
@@ -56,6 +62,7 @@ import type { ClientBridge, ClientBridgePermissionOutcome } from "./client-bridg
 import { toolReadsSkillUris } from "../system-prompt";
 
 import type { CustomMessage } from "./messages";
+import { SESSION_AGENT_NOTICE_TYPE } from "./queued-messages";
 import type { SessionEntry } from "./session-entries";
 import type { SessionManager } from "./session-manager";
 
@@ -254,7 +261,6 @@ export function projectMountedMCPXdevGuidance(routes: Iterable<MountedMCPToolRou
 const TOOL_ROSTER_NOTICE_MESSAGE_TYPE = "tool-roster-notice";
 const XDEV_MOUNT_NOTICE_MESSAGE_TYPE = "xdev-mount-notice";
 const EVAL_PRELUDE_NOTICE_MESSAGE_TYPE = "eval-prelude-notice";
-const SESSION_AGENT_NOTICE_MESSAGE_TYPE = "session-agent-notice";
 
 /** Custom entry holding the digest of the base prompt the branch's primary model calls are built from. */
 const SYSTEM_PROMPT_DIGEST_CUSTOM_TYPE = "system-prompt-digest";
@@ -295,7 +301,7 @@ interface EvalPreludeNoticeDetails {
 	removed: string[];
 }
 
-/** Agent pseudonyms added/removed by one hidden {@link SESSION_AGENT_NOTICE_MESSAGE_TYPE} message. */
+/** Agent pseudonyms added/removed by one hidden {@link SESSION_AGENT_NOTICE_TYPE} message. */
 interface SessionAgentNoticeDetails {
 	added: string[];
 	removed: string[];
@@ -940,7 +946,9 @@ export class SessionTools {
 					onUpdate: never,
 					ctx: AgentToolContext | undefined,
 				) => {
-					let cacheable = true;
+					const restrictions = approvalRestrictions(this.#host.settings, this.#host.sessionManager.getCwd());
+					// A restricted call is approved per call: a remembered ACP answer never covers it.
+					let cacheable = restrictedFolderReason(target, args, restrictions) === undefined;
 					if (target.name === "bash") {
 						const explicitAutoApprove = this.#isExplicitAutoApproveMode();
 						const { approvalMode, userPolicies } = resolveApprovalFromContext({
@@ -954,6 +962,7 @@ export class SessionTools {
 							mode,
 							userPolicies,
 							getApprovalGrants(this.#host.settings.getAgentDir(), this.#host.sessionManager.getSessionId()),
+							restrictions,
 						);
 						if (resolved.policy === "deny") throw denyError(resolved, target.name);
 						if (resolved.policy === "allow") {
@@ -1756,7 +1765,7 @@ export class SessionTools {
 	takeSessionAgentNotice(): CustomMessage<SessionAgentNoticeDetails> | undefined {
 		const known = new Set(this.#promptSurface.sessionAgents.map(agent => agent.name));
 		for (const message of this.#host.agent.state.messages) {
-			if (message.role !== "custom" || message.customType !== SESSION_AGENT_NOTICE_MESSAGE_TYPE) continue;
+			if (message.role !== "custom" || message.customType !== SESSION_AGENT_NOTICE_TYPE) continue;
 			const details = message.details;
 			if (!isRecord(details) || !Array.isArray(details.added) || !Array.isArray(details.removed)) continue;
 			for (const name of details.added) if (typeof name === "string") known.add(name);
@@ -1769,7 +1778,7 @@ export class SessionTools {
 		if (added.length === 0 && removed.length === 0) return undefined;
 		return {
 			role: "custom",
-			customType: SESSION_AGENT_NOTICE_MESSAGE_TYPE,
+			customType: SESSION_AGENT_NOTICE_TYPE,
 			content: prompt.render(sessionAgentNoticePrompt, {
 				added: added.map(agent => ({ name: agent.name, description: agent.description })),
 				removed,

@@ -84,9 +84,8 @@ function formatTodoList(incompleteByPhase: IncompletePhase[]): string {
 }
 
 /**
- * True when the latest todo snapshot's entry sits at or after the compaction keep
- * boundary — i.e. the snapshot survives in the kept tail the model still sees, so a
- * reassertion would be redundant.
+ * Skip a retained todo tool result, but not a data-only user edit. Raw custom
+ * entries never reach the model; an adjacent message does not prove they do.
  */
 function snapshotKeptAfterCompaction(
 	entries: SessionEntry[],
@@ -100,30 +99,36 @@ function snapshotKeptAfterCompaction(
 		if (id === firstKeptEntryId && boundaryIndex < 0) boundaryIndex = index;
 		if (id === snapshotEntryId) snapshotIndex = index;
 	}
-	return boundaryIndex >= 0 && snapshotIndex >= boundaryIndex;
+	if (boundaryIndex < 0 || snapshotIndex < boundaryIndex) return false;
+	return entries[snapshotIndex]?.type === "message";
+}
+
+/** Marker a task carries in the canonical render: pending stays bare, every other status is bracketed. */
+function formatCanonicalTaskMarker(task: TodoItem): string {
+	switch (task.status) {
+		case "pending":
+			return "";
+		case "in_progress":
+			return " [in_progress]";
+		case "completed":
+			return " [completed]";
+		case "abandoned":
+			return " [abandoned]";
+		case "blocked":
+			return task.blocker !== undefined ? ` [blocked: ${task.blocker}]` : " [blocked]";
+	}
 }
 
 /**
  * Renders the full canonical todo list for the post-compaction reassertion: every
- * task keeps its status, and blocked tasks carry their blocker note, so the resumed
- * turn has the complete state and does not re-`init` from a subset.
+ * real status keeps its marker (abandoned included, so deliberately dropped work is
+ * not presented as open) and blocked tasks carry their blocker note when present,
+ * so the resumed turn has the complete state and does not re-`init` from a subset.
  */
 function formatCanonicalTodoList(phases: TodoPhase[]): string {
 	return phases
 		.map(phase => {
-			const tasks = phase.tasks
-				.map(task => {
-					const marker =
-						task.status === "completed"
-							? " [completed]"
-							: task.status === "in_progress"
-								? " [in_progress]"
-								: task.blocker !== undefined
-									? ` [blocked: ${task.blocker}]`
-									: "";
-					return `  - ${task.content}${marker}`;
-				})
-				.join("\n");
+			const tasks = phase.tasks.map(task => `  - ${task.content}${formatCanonicalTaskMarker(task)}`).join("\n");
 			return `- ${phase.name}\n${tasks}`;
 		})
 		.join("\n");
@@ -170,6 +175,10 @@ export class TodoTracker {
 	/** Replaces todo phases with a defensive clone. */
 	setPhases(phases: TodoPhase[]): void {
 		this.#phases = this.#clonePhases(phases);
+		// Every state write lands here — the native tool, a Cursor sync, or a
+		// bridged call — so the nudge budget re-arms on the progress it
+		// rations. Views, failed batches, and unchanged reads never arrive.
+		this.#midRunNudgeCount = 0;
 	}
 
 	/** Rehydrates todo phases from the current transcript branch. */
@@ -297,10 +306,9 @@ export class TodoTracker {
 	 * (gated on `todo.eager`, and deliberately silent once a list exists), this
 	 * nudge fires exactly then: compaction summarized away the `todo` tool results
 	 * that created the list, so the resumed turn no longer sees it (#16738). It
-	 * stays silent when the latest todo snapshot is still inside the kept tail
-	 * (the model already sees it) and renders the full list — blocked tasks with
-	 * their blocker note, completed tasks included — so the model does not
-	 * re-`init` from a subset and drop work (#16753 review).
+	 * skips retained todo tool results and renders the full list, including
+	 * blocked and abandoned tasks. Data-only user edits are reasserted even if a
+	 * separate manual-edit reminder may also have survived.
 	 */
 	buildPostCompactionTodoReassertion(): AgentMessage | undefined {
 		if (!cfgTodoEnabled.get(this.#host.settings) || !cfgTodoReminders.get(this.#host.settings)) {
