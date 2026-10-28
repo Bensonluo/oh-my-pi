@@ -35,6 +35,8 @@ type ObservedPromptCall = {
 	toolChoice: string | undefined;
 	text: string;
 	reassertionText: string | undefined;
+	reassertionCount: number;
+	visibleTodoToolResultCount: number;
 };
 
 type WaitForCall = (predicate: (call: ObservedPromptCall) => boolean) => Promise<ObservedPromptCall>;
@@ -50,7 +52,7 @@ type Harness = {
 	 * by prompt wording (AGENTS.md forbids wording assertions); the reminder turn
 	 * only fires after the auto-continuation in this harness.
 	 */
-	waitForPostCompactionCall: () => Promise<ObservedPromptCall>;
+	waitForPostCompactionCall: (compactionIndex?: number) => Promise<ObservedPromptCall>;
 };
 
 function getToolChoiceName(choice: unknown): string | undefined {
@@ -184,6 +186,8 @@ describe("AgentSession post-compaction todo reassertion", () => {
 	async function createHarness(settingsOverride: Record<string, unknown> = {}): Promise<Harness> {
 		const observedCalls: ObservedPromptCall[] = [];
 		let reassertionText: string | undefined;
+		let reassertionCount = 0;
+		let visibleTodoToolResultCount = 0;
 		const waiters: Array<{
 			predicate: (call: ObservedPromptCall) => boolean;
 			resolve: (call: ObservedPromptCall) => void;
@@ -234,10 +238,14 @@ describe("AgentSession post-compaction todo reassertion", () => {
 			initialState: { model, systemPrompt: ["Test"], tools, messages: [] },
 			convertToLlm,
 			transformContext: async messages => {
-				const reassertion = messages.find(
+				const reassertions = messages.filter(
 					message => message.role === "custom" && message.customType === POST_COMPACTION_TODO_MESSAGE_TYPE,
 				);
-				reassertionText = reassertion ? getMessageText(reassertion) : undefined;
+				reassertionText = reassertions[0] ? getMessageText(reassertions[0]) : undefined;
+				reassertionCount = reassertions.length;
+				visibleTodoToolResultCount = messages.filter(
+					message => message.role === "toolResult" && message.toolName === "todo",
+				).length;
 				return messages;
 			},
 			getToolChoice: () => session?.nextToolChoiceDirective(),
@@ -247,6 +255,8 @@ describe("AgentSession post-compaction todo reassertion", () => {
 					toolChoice: getToolChoiceName(options?.toolChoice),
 					text: context.messages.map(message => getMessageText(message)).join("\n"),
 					reassertionText,
+					reassertionCount,
+					visibleTodoToolResultCount,
 				};
 				observedCalls.push(call);
 				for (let i = waiters.length - 1; i >= 0; i--) {
@@ -291,17 +301,21 @@ describe("AgentSession post-compaction todo reassertion", () => {
 		// Lifecycle boundary for the post-compaction turn: once a compaction run
 		// completes, the next provider call is the auto-continuation. Registered
 		// before the turn is driven, so the waiter never misses the call.
-		let postCompactionFloor: number | undefined;
+		const postCompactionFloors: number[] = [];
 		const unsubscribe = session.subscribe((event: AgentSessionEvent) => {
 			if (event.type === "auto_compaction_end" && event.result !== undefined && !event.aborted) {
-				postCompactionFloor ??= observedCalls.length;
+				postCompactionFloors.push(observedCalls.length);
 			}
 		});
 		cleanups.push(async () => {
 			unsubscribe();
 		});
-		const waitForPostCompactionCall = () =>
-			waitForCall(call => postCompactionFloor !== undefined && call.callIndex >= postCompactionFloor);
+		const waitForPostCompactionCall = (compactionIndex = 0) =>
+			waitForCall(
+				call =>
+					postCompactionFloors[compactionIndex] !== undefined &&
+					call.callIndex >= postCompactionFloors[compactionIndex],
+			);
 
 		cleanups.push(() => session.dispose());
 		return { session, observedCalls, sessionManager, waitForCall, waitForPostCompactionCall };
@@ -533,6 +547,25 @@ describe("AgentSession post-compaction todo reassertion", () => {
 		expect(continuation.reassertionText).toContain("in_progress");
 	});
 
+	it("reasserts conservatively when the native replay boundary is missing", async () => {
+		const { session, sessionManager, waitForPostCompactionCall } = await createHarness();
+		activateOngoingGoal(session);
+		await session.prompt("refactor the parser across modules");
+		appendUserTodoEdit(sessionManager, [
+			{
+				name: "Work",
+				tasks: [{ content: "finish the parser", status: "in_progress" }],
+			},
+		]);
+		stubCompaction("", { throughEntryId: "missing-native-replay-boundary" });
+		const continuationPromise = waitForPostCompactionCall();
+		emitHighUsageTurn(session);
+		const continuation = await continuationPromise;
+
+		expect(continuation.reassertionCount).toBe(1);
+		expect(continuation.reassertionText).toContain("finish the parser");
+	});
+
 	it("reasserts a todo result covered by full OpenAI remote replacement", async () => {
 		const { session, sessionManager, waitForPostCompactionCall } = await createHarness();
 		activateOngoingGoal(session);
@@ -549,8 +582,37 @@ describe("AgentSession post-compaction todo reassertion", () => {
 		emitHighUsageTurn(session);
 		const continuation = await continuationPromise;
 
+		expect(continuation.visibleTodoToolResultCount).toBe(0);
 		expect(continuation.reassertionText).toContain("finish the parser");
 		expect(continuation.reassertionText).toContain("in_progress");
+	});
+
+	it("does not reassert an OpenAI snapshot appended after compaction", async () => {
+		const { session, sessionManager, waitForPostCompactionCall } = await createHarness();
+		activateOngoingGoal(session);
+		await session.prompt("refactor the parser across modules");
+		const phases = [
+			{
+				name: "Work",
+				tasks: [{ content: "finish the parser", status: "in_progress" }],
+			},
+		];
+		appendUserTodoEdit(sessionManager, phases);
+		const firstKeptEntryId = sessionManager.appendCustomEntry("remote-kept-boundary", {});
+		stubCompaction(firstKeptEntryId, { provider: "openai" });
+		const unsubscribe = session.subscribe(event => {
+			if (event.type === "auto_compaction_end" && event.result !== undefined && !event.aborted) {
+				unsubscribe();
+				appendTodoToolResultEntry(sessionManager, phases);
+				session.agent.replaceMessages(sessionManager.buildSessionContext().messages);
+			}
+		});
+		const continuationPromise = waitForPostCompactionCall();
+		emitHighUsageTurn(session);
+		const continuation = await continuationPromise;
+
+		expect(continuation.visibleTodoToolResultCount).toBe(1);
+		expect(continuation.reassertionCount).toBe(0);
 	});
 
 	it("reasserts a todo result covered by OpenAI prefix replay", async () => {
@@ -645,6 +707,33 @@ describe("AgentSession post-compaction todo reassertion", () => {
 
 		expect(continuation.reassertionText).toContain("finish the parser");
 		expect(continuation.reassertionText).toContain("in_progress");
+	});
+
+	it("does not replay an old reminder and inject a duplicate on the next compaction", async () => {
+		const { session, sessionManager, waitForPostCompactionCall } = await createHarness();
+		const firstContinuation = await runToContinuationWithTodos(session, sessionManager, waitForPostCompactionCall, [
+			{
+				name: "Work",
+				tasks: [{ content: "finish the parser", status: "in_progress" }],
+			},
+		]);
+		expect(firstContinuation.reassertionCount).toBe(1);
+		await session.waitForIdle();
+
+		// Keep the region where the first reminder would be persisted. A durable
+		// reminder would replay here while the original todo edit stays summarized.
+		const autoContinueEntry = sessionManager
+			.getBranch()
+			.findLast(
+				entry => entry.type === "message" && entry.message.role === "developer" && entry.message.synthetic === true,
+			);
+		if (!autoContinueEntry) throw new Error("Expected the first auto-continuation entry");
+		stubCompaction(autoContinueEntry.id);
+		const secondContinuationPromise = waitForPostCompactionCall(1);
+		emitHighUsageTurn(session);
+		const secondContinuation = await secondContinuationPromise;
+
+		expect(secondContinuation.reassertionCount).toBe(1);
 	});
 
 	it("does not reassert when no todo list exists", async () => {
