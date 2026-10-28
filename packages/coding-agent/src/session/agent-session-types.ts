@@ -309,6 +309,12 @@ export interface AgentSessionConfig {
 	transformContext?: (messages: AgentMessage[], signal?: AbortSignal) => AgentMessage[] | Promise<AgentMessage[]>;
 	/** Provider request transform applied after message conversion. */
 	transformProviderContext?: (context: Context, model: Model) => Context | Promise<Context>;
+	/**
+	 * Builds one advisor's provider request transform. Each advisor is its own
+	 * conversation, so it gets its own transform state (the date/cwd reminder).
+	 * Without it, advisors share {@link transformProviderContext}.
+	 */
+	createAdvisorTransformProviderContext?: () => (context: Context, model: Model) => Context | Promise<Context>;
 	/** Stream wrapper for side-channel requests. */
 	sideStreamFn?: StreamFn;
 	/** Stream wrapper for advisor requests. */
@@ -461,6 +467,14 @@ export interface PromptOptions {
 	 * failed before admission still only settles through the returned promise.
 	 */
 	onPromptAdmitted?: () => void;
+	/**
+	 * Called synchronously when this prompt is pushed onto the steer or
+	 * follow-up queue, just before {@link onPromptAdmitted}, with the messages it
+	 * pushed (its hidden companions, then the prompt), so a caller can tell them
+	 * from other queued work. Not called when the prompt starts its own turn or
+	 * is queued as an aside.
+	 */
+	onPromptQueued?: (queued: readonly AgentMessage[]) => void;
 }
 
 /** Payload for {@link AgentSession.setPromptDropped}: a user prompt cancelled
@@ -483,12 +497,16 @@ export interface FollowUpOptions {
 	expandPromptTemplates?: boolean;
 	/** Explicit billing/initiator attribution. */
 	attribution?: MessageAttribution;
+	/** Called synchronously with the messages pushed onto the follow-up queue. See {@link PromptOptions.onPromptQueued}. */
+	onPromptQueued?: PromptOptions["onPromptQueued"];
 }
 
 /** Options for AgentSession.steer(). */
 export interface SteerOptions {
 	/** Explicit billing/initiator attribution. */
 	attribution?: MessageAttribution;
+	/** Called synchronously with the messages pushed onto the steering queue. See {@link PromptOptions.onPromptQueued}. */
+	onPromptQueued?: PromptOptions["onPromptQueued"];
 }
 
 /** Options for AgentSession.sendUserMessage(). */
