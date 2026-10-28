@@ -7,8 +7,8 @@ import eagerTodoPrompt from "../prompts/system/eager-todo.md" with { type: "text
 import midRunTodoNudgePrompt from "../prompts/system/mid-run-todo-nudge.md" with { type: "text" };
 import postCompactionTodoPrompt from "../prompts/system/post-compaction-todo.md" with { type: "text" };
 import { getLatestTodoPhasesFromEntries, getLatestTodoSnapshotIdentity, isTodoPhase } from "../tools/todo";
-import { getLatestCompactionEntry } from "./session-context";
-import type { SessionEntry } from "../session/session-entries";
+import { getLatestCompactionEntry, getOpenAiRemoteCompactionPayload } from "./session-context";
+import type { CompactionEntry, SessionEntry } from "../session/session-entries";
 import { type TodoItem, type TodoPhase } from "@oh-my-pi/pi-tui/tools/todo";
 import { buildNamedToolChoice } from "../utils/tool-choice";
 import type { AgentSessionEvent } from "./agent-session-events";
@@ -30,7 +30,7 @@ const MID_RUN_NUDGE_MESSAGE_TYPE = "mid-run-todo-nudge";
 /** Message type of the hidden first-turn reminder {@link TodoTracker.createEagerTodoPrelude} builds. */
 export const EAGER_TODO_PRELUDE_MESSAGE_TYPE = "eager-todo-prelude";
 /** Message type of the reminder-only todo reassertion {@link TodoTracker.buildPostCompactionTodoReassertion} builds. */
-const POST_COMPACTION_TODO_MESSAGE_TYPE = "post-compaction-todo";
+export const POST_COMPACTION_TODO_MESSAGE_TYPE = "post-compaction-todo";
 const MARKDOWN_PROMPT_PREFIX_RE = /^(?:>\s*)?(?:(?:[-*+]|\d+[.)])\s+)*/;
 const PROMPT_LABEL_RE = /^(?:q(?:uestion)?|ask)\s*\d*\s*[:.)-]\s*/i;
 const INLINE_EMPHASIS_RE = /(\*\*|__)(.*?)\1/g;
@@ -89,18 +89,42 @@ function formatTodoList(incompleteByPhase: IncompletePhase[]): string {
  */
 function snapshotKeptAfterCompaction(
 	entries: SessionEntry[],
-	firstKeptEntryId: string,
+	compaction: CompactionEntry,
 	snapshotEntryId: string,
 ): boolean {
 	let boundaryIndex = -1;
+	let replayThroughIndex = -1;
 	let snapshotIndex = -1;
+	let compactionIndex = -1;
 	for (let index = 0; index < entries.length; index++) {
 		const id = entries[index]?.id;
-		if (id === firstKeptEntryId && boundaryIndex < 0) boundaryIndex = index;
+		if (id === compaction.firstKeptEntryId && boundaryIndex < 0) boundaryIndex = index;
+		if (id === compaction.providerReplayThroughEntryId && replayThroughIndex < 0) replayThroughIndex = index;
 		if (id === snapshotEntryId) snapshotIndex = index;
+		if (id === compaction.id) compactionIndex = index;
 	}
-	if (boundaryIndex < 0 || snapshotIndex < boundaryIndex) return false;
-	return entries[snapshotIndex]?.type === "message";
+	const snapshotEntry = entries[snapshotIndex];
+	if (snapshotEntry?.type !== "message" || snapshotEntry.message.role !== "toolResult") return false;
+	// Pruning preserves details.phases for tracker rehydration but replaces the
+	// model-visible result with a placeholder, so it is not a visible todo list.
+	if (snapshotEntry.message.prunedAt !== undefined) return false;
+	// OpenAI replacement history does not guarantee the original todo toolResult
+	// survives (V2 retains selected user items plus opaque compaction state). Only
+	// the raw suffix after a prefix-replay boundary or entries after compaction
+	// prove the snapshot is still model-visible without a separate reassertion.
+	if (getOpenAiRemoteCompactionPayload(compaction) !== undefined) {
+		if (compactionIndex >= 0 && snapshotIndex > compactionIndex) return true;
+		if (compaction.providerReplayThroughEntryId) {
+			return replayThroughIndex >= 0 && snapshotIndex > replayThroughIndex;
+		}
+		return false;
+	}
+	// Native compaction can cover only the prefix through providerReplayThroughEntryId;
+	// buildSessionContext then emits later entries even with an empty firstKeptEntryId.
+	if (compaction.firstKeptEntryId === "" && compaction.providerReplayThroughEntryId) {
+		return replayThroughIndex >= 0 && snapshotIndex > replayThroughIndex;
+	}
+	return boundaryIndex >= 0 && snapshotIndex >= boundaryIndex;
 }
 
 /** Marker a task carries in the canonical render: pending stays bare, every other status is bracketed. */
@@ -320,15 +344,17 @@ export class TodoTracker {
 		const branch = this.#host.sessionManager.getBranch();
 		const compaction = getLatestCompactionEntry(branch);
 		const snapshot = getLatestTodoSnapshotIdentity(branch);
-		if (
-			compaction &&
-			snapshot &&
-			snapshotKeptAfterCompaction(branch, compaction.firstKeptEntryId, snapshot.sourceEntryId)
-		) {
+		if (compaction && snapshot && snapshotKeptAfterCompaction(branch, compaction, snapshot.sourceEntryId)) {
 			return undefined;
 		}
-		const incomplete = this.#incompleteByPhase().flatMap(phase => phase.tasks);
-		if (incomplete.length === 0) return undefined;
+		// Blocked work is not actionable for stop-time reminders, but it is still
+		// surviving canonical state that the model must not lose after compaction.
+		const hasSurvivingWork = this.#phases.some(phase =>
+			phase.tasks.some(
+				task => task.status === "pending" || task.status === "in_progress" || task.status === "blocked",
+			),
+		);
+		if (!hasSurvivingWork) return undefined;
 		const { toolRefs } = this.#buildEagerPreludeContext();
 		return {
 			role: "custom",

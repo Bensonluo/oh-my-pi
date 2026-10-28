@@ -12,6 +12,7 @@ import type { AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { POST_COMPACTION_TODO_MESSAGE_TYPE } from "@oh-my-pi/pi-coding-agent/session/todo-tracker";
 import { TodoTool, type ToolSession, USER_TODO_EDIT_CUSTOM_TYPE } from "@oh-my-pi/pi-coding-agent/tools";
 import { TempDir } from "@oh-my-pi/pi-utils";
 
@@ -23,18 +24,17 @@ import { TempDir } from "@oh-my-pi/pi-utils";
 // and is skipped for a kept `todo` toolResult. Raw `user_todo_edit` custom entries
 // are data-only and still need reassertion, regardless of adjacent messages.
 //
-// The goal-mode auto-continuation prompt already carries a `<todo_context>` block
-// (bracket-first, no blocker notes), so these tests assert on the canonical render
-// shape of the reassertion — `<content> [<status>]` / `[blocked: <note>]` — which only
-// the post-compaction reassertion produces. Custom nudge messages are also normalized
-// into the context before they reach the provider stream, so message roles are not
-// asserted. The continuation turn is selected at the `auto_compaction_end` lifecycle
-// boundary (first provider call at/after it), never by prompt wording.
+// Tests identify the prepend-only message by POST_COMPACTION_TODO_MESSAGE_TYPE in
+// transformContext before provider conversion, then assert task/status/blocker
+// semantics rather than prompt wording or Markdown layout. The continuation turn
+// is selected at the `auto_compaction_end` lifecycle boundary (first provider call
+// at/after it), never by prompt wording.
 
 type ObservedPromptCall = {
 	callIndex: number;
 	toolChoice: string | undefined;
 	text: string;
+	reassertionText: string | undefined;
 };
 
 type WaitForCall = (predicate: (call: ObservedPromptCall) => boolean) => Promise<ObservedPromptCall>;
@@ -104,25 +104,38 @@ function createAssistantResponse(text: string) {
 }
 
 /** Short-circuit the LLM summary so compaction completes without a network call. */
-function stubCompaction(firstKeptEntryId?: string): void {
+function stubCompaction(firstKeptEntryId?: string, replay?: { throughEntryId?: string; provider?: "openai" }): void {
 	vi.spyOn(compactionModule, "compact").mockImplementation(async preparation => ({
 		summary: "compacted",
 		shortSummary: undefined,
 		firstKeptEntryId: firstKeptEntryId ?? preparation.firstKeptEntryId,
 		tokensBefore: preparation.tokensBefore,
 		details: {},
+		preserveData:
+			replay?.provider === "openai"
+				? {
+						openaiRemoteCompaction: {
+							provider: "openai",
+							replacementHistory: [{ type: "compaction", encrypted_content: "test-encrypted-state" }],
+							compactionItem: { type: "compaction", encrypted_content: "test-encrypted-state" },
+						},
+					}
+				: replay
+					? { anthropicCompaction: { provider: "anthropic", content: "compacted", signature: "test-signature" } }
+					: undefined,
+		providerReplayThroughEntryId: replay?.throughEntryId,
 	}));
 }
 
 /** Emit a high-usage assistant turn to drive threshold (context-full) auto-compaction. */
-function emitHighUsageTurn(session: AgentSession): void {
+function emitHighUsageTurn(session: AgentSession, nonTerminal = false): void {
 	const assistantMsg = {
 		role: "assistant" as const,
 		content: [{ type: "text" as const, text: "Done." }],
 		api: "anthropic-messages" as const,
 		provider: "anthropic" as const,
 		model: "claude-sonnet-4-5",
-		stopReason: "stop" as const,
+		stopReason: nonTerminal ? ("toolUse" as const) : ("stop" as const),
 		usage: {
 			input: 190_000,
 			output: 1_000,
@@ -170,6 +183,7 @@ describe("AgentSession post-compaction todo reassertion", () => {
 
 	async function createHarness(settingsOverride: Record<string, unknown> = {}): Promise<Harness> {
 		const observedCalls: ObservedPromptCall[] = [];
+		let reassertionText: string | undefined;
 		const waiters: Array<{
 			predicate: (call: ObservedPromptCall) => boolean;
 			resolve: (call: ObservedPromptCall) => void;
@@ -219,12 +233,20 @@ describe("AgentSession post-compaction todo reassertion", () => {
 			getApiKey: () => "test-key",
 			initialState: { model, systemPrompt: ["Test"], tools, messages: [] },
 			convertToLlm,
+			transformContext: async messages => {
+				const reassertion = messages.find(
+					message => message.role === "custom" && message.customType === POST_COMPACTION_TODO_MESSAGE_TYPE,
+				);
+				reassertionText = reassertion ? getMessageText(reassertion) : undefined;
+				return messages;
+			},
 			getToolChoice: () => session?.nextToolChoiceDirective(),
 			streamFn: (_model, context, options) => {
 				const call: ObservedPromptCall = {
 					callIndex: observedCalls.length,
 					toolChoice: getToolChoiceName(options?.toolChoice),
 					text: context.messages.map(message => getMessageText(message)).join("\n"),
+					reassertionText,
 				};
 				observedCalls.push(call);
 				for (let i = waiters.length - 1; i >= 0; i--) {
@@ -323,7 +345,7 @@ describe("AgentSession post-compaction todo reassertion", () => {
 			role: "toolResult",
 			toolCallId: "todo-snapshot-call",
 			toolName: "todo",
-			content: [{ type: "text" as const, text: "Updated todo list" }],
+			content: [{ type: "text" as const, text: JSON.stringify(phases) ?? "[]" }],
 			details: { op: "start", phases },
 			isError: false,
 			timestamp: Date.now(),
@@ -379,17 +401,44 @@ describe("AgentSession post-compaction todo reassertion", () => {
 			},
 		]);
 
-		// Canonical render shape: every real status keeps its marker and blocked
-		// tasks keep their blocker note — none of which the goal-mode
-		// <todo_context> block produces. Pending tasks stay unmarked.
-		expect(continuation.text).toContain("- do the thing\n");
-		expect(continuation.text).toContain("- finish the parser [in_progress]");
-		expect(continuation.text).toContain("- awaiting review [blocked: reviewer feedback]");
-		expect(continuation.text).toContain("- parked on ci capacity [blocked]");
-		expect(continuation.text).toContain("- the old approach [abandoned]");
-		expect(continuation.text).toContain("- done thing [completed]");
+		const reassertion = continuation.reassertionText;
+		expect(reassertion).toBeDefined();
+		for (const fragment of [
+			"do the thing",
+			"finish the parser",
+			"in_progress",
+			"awaiting review",
+			"blocked",
+			"reviewer feedback",
+			"parked on ci capacity",
+			"the old approach",
+			"abandoned",
+			"done thing",
+			"completed",
+		]) {
+			expect(reassertion).toContain(fragment);
+		}
 		// Reminder-only: never a forced tool_choice on the resumed turn.
 		expect(continuation.toolChoice).toBeUndefined();
+	});
+
+	it("reasserts on an ordinary non-goal auto-continuation", async () => {
+		const { session, sessionManager, waitForPostCompactionCall } = await createHarness();
+		await session.prompt("refactor the parser across modules");
+		appendUserTodoEdit(sessionManager, [
+			{
+				name: "Work",
+				tasks: [{ content: "finish the parser", status: "in_progress" }],
+			},
+		]);
+		const boundaryEntryId = sessionManager.appendCustomEntry("compaction-boundary-marker", {});
+		stubCompaction(boundaryEntryId);
+		const continuationPromise = waitForPostCompactionCall();
+		emitHighUsageTurn(session, true);
+		const continuation = await continuationPromise;
+
+		expect(continuation.reassertionText).toContain("finish the parser");
+		expect(continuation.reassertionText).toContain("in_progress");
 	});
 
 	it("does not reassert when a visible todo toolResult snapshot is still inside the kept tail", async () => {
@@ -412,12 +461,138 @@ describe("AgentSession post-compaction todo reassertion", () => {
 		emitHighUsageTurn(session);
 		const continuation = await continuationPromise;
 
-		// The snapshot is visible in the kept tail, so the canonical reassertion
-		// (content-then-marker shape) must not fire. The todo reminder turn and the
-		// goal-mode todo_context render these tasks without markers, so the marker
-		// shape isolates the reassertion.
-		expect(continuation.text).not.toContain("- finish the parser [in_progress]");
-		expect(continuation.text).not.toContain("- done thing [completed]");
+		// The snapshot is visible in the kept tail, so no separate reassertion
+		// custom message should be prepended to this continuation.
+		expect(continuation.text).toContain("finish the parser");
+		expect(continuation.text).toContain("done thing");
+		expect(continuation.reassertionText).toBeUndefined();
+	});
+
+	it("reasserts when the kept canonical todo result has been pruned", async () => {
+		const { session, sessionManager, waitForPostCompactionCall } = await createHarness();
+		activateOngoingGoal(session);
+		await session.prompt("refactor the parser across modules");
+		const todoEntryId = appendTodoToolResultEntry(sessionManager, [
+			{
+				name: "Work",
+				tasks: [{ content: "finish the parser", status: "in_progress" }],
+			},
+		]);
+		const todoEntry = sessionManager.getBranch().find(entry => entry.id === todoEntryId);
+		if (todoEntry?.type !== "message" || todoEntry.message.role !== "toolResult") {
+			throw new Error("Expected todo toolResult entry");
+		}
+		todoEntry.message.content = [{ type: "text", text: "[Output truncated - 100 tokens]" }];
+		todoEntry.message.prunedAt = Date.now();
+		stubCompaction(todoEntryId);
+		const continuationPromise = waitForPostCompactionCall();
+		emitHighUsageTurn(session);
+		const continuation = await continuationPromise;
+
+		expect(continuation.reassertionText).toContain("finish the parser");
+		expect(continuation.reassertionText).toContain("in_progress");
+	});
+
+	it("does not reassert a visible todo result after the native replay boundary", async () => {
+		const { session, sessionManager, waitForPostCompactionCall } = await createHarness();
+		activateOngoingGoal(session);
+		await session.prompt("refactor the parser across modules");
+		const replayThroughEntryId = sessionManager.appendCustomEntry("native-replay-boundary", {});
+		appendTodoToolResultEntry(sessionManager, [
+			{
+				name: "Work",
+				tasks: [{ content: "finish the parser", status: "in_progress" }],
+			},
+		]);
+		stubCompaction("", { throughEntryId: replayThroughEntryId });
+		const continuationPromise = waitForPostCompactionCall();
+		emitHighUsageTurn(session);
+		const continuation = await continuationPromise;
+
+		expect(continuation.text).toContain("finish the parser");
+		expect(continuation.reassertionText).toBeUndefined();
+	});
+
+	it("reasserts a todo result summarized before the native replay boundary", async () => {
+		const { session, sessionManager, waitForPostCompactionCall } = await createHarness();
+		activateOngoingGoal(session);
+		await session.prompt("refactor the parser across modules");
+		appendTodoToolResultEntry(sessionManager, [
+			{
+				name: "Work",
+				tasks: [{ content: "finish the parser", status: "in_progress" }],
+			},
+		]);
+		const replayThroughEntryId = sessionManager.appendCustomEntry("native-replay-boundary", {});
+		stubCompaction("", { throughEntryId: replayThroughEntryId });
+		const continuationPromise = waitForPostCompactionCall();
+		emitHighUsageTurn(session);
+		const continuation = await continuationPromise;
+
+		expect(continuation.reassertionText).toContain("finish the parser");
+		expect(continuation.reassertionText).toContain("in_progress");
+	});
+
+	it("reasserts a todo result covered by full OpenAI remote replacement", async () => {
+		const { session, sessionManager, waitForPostCompactionCall } = await createHarness();
+		activateOngoingGoal(session);
+		await session.prompt("refactor the parser across modules");
+		const firstKeptEntryId = sessionManager.appendCustomEntry("remote-kept-boundary", {});
+		appendTodoToolResultEntry(sessionManager, [
+			{
+				name: "Work",
+				tasks: [{ content: "finish the parser", status: "in_progress" }],
+			},
+		]);
+		stubCompaction(firstKeptEntryId, { provider: "openai" });
+		const continuationPromise = waitForPostCompactionCall();
+		emitHighUsageTurn(session);
+		const continuation = await continuationPromise;
+
+		expect(continuation.reassertionText).toContain("finish the parser");
+		expect(continuation.reassertionText).toContain("in_progress");
+	});
+
+	it("reasserts a todo result covered by OpenAI prefix replay", async () => {
+		const { session, sessionManager, waitForPostCompactionCall } = await createHarness();
+		activateOngoingGoal(session);
+		await session.prompt("refactor the parser across modules");
+		const firstKeptEntryId = sessionManager.appendCustomEntry("remote-kept-boundary", {});
+		appendTodoToolResultEntry(sessionManager, [
+			{
+				name: "Work",
+				tasks: [{ content: "finish the parser", status: "in_progress" }],
+			},
+		]);
+		const replayThroughEntryId = sessionManager.appendCustomEntry("remote-replay-boundary", {});
+		stubCompaction(firstKeptEntryId, { provider: "openai", throughEntryId: replayThroughEntryId });
+		const continuationPromise = waitForPostCompactionCall();
+		emitHighUsageTurn(session);
+		const continuation = await continuationPromise;
+
+		expect(continuation.reassertionText).toContain("finish the parser");
+		expect(continuation.reassertionText).toContain("in_progress");
+	});
+
+	it("does not reassert a raw todo result after the OpenAI prefix replay boundary", async () => {
+		const { session, sessionManager, waitForPostCompactionCall } = await createHarness();
+		activateOngoingGoal(session);
+		await session.prompt("refactor the parser across modules");
+		const firstKeptEntryId = sessionManager.appendCustomEntry("remote-kept-boundary", {});
+		const replayThroughEntryId = sessionManager.appendCustomEntry("remote-replay-boundary", {});
+		appendTodoToolResultEntry(sessionManager, [
+			{
+				name: "Work",
+				tasks: [{ content: "finish the parser", status: "in_progress" }],
+			},
+		]);
+		stubCompaction(firstKeptEntryId, { provider: "openai", throughEntryId: replayThroughEntryId });
+		const continuationPromise = waitForPostCompactionCall();
+		emitHighUsageTurn(session);
+		const continuation = await continuationPromise;
+
+		expect(continuation.text).toContain("finish the parser");
+		expect(continuation.reassertionText).toBeUndefined();
 	});
 
 	it("reasserts a kept user todo edit: custom entries are never model-visible", async () => {
@@ -443,8 +618,10 @@ describe("AgentSession post-compaction todo reassertion", () => {
 		emitHighUsageTurn(session);
 		const continuation = await continuationPromise;
 
-		expect(continuation.text).toContain("- finish the parser [in_progress]");
-		expect(continuation.text).toContain("- done thing [completed]");
+		expect(continuation.reassertionText).toContain("finish the parser");
+		expect(continuation.reassertionText).toContain("in_progress");
+		expect(continuation.reassertionText).toContain("done thing");
+		expect(continuation.reassertionText).toContain("completed");
 	});
 
 	it("reasserts a kept user todo edit followed by an unrelated developer message", async () => {
@@ -466,7 +643,8 @@ describe("AgentSession post-compaction todo reassertion", () => {
 		emitHighUsageTurn(session);
 		const continuation = await continuationPromise;
 
-		expect(continuation.text).toContain("- finish the parser [in_progress]");
+		expect(continuation.reassertionText).toContain("finish the parser");
+		expect(continuation.reassertionText).toContain("in_progress");
 	});
 
 	it("does not reassert when no todo list exists", async () => {
@@ -478,9 +656,41 @@ describe("AgentSession post-compaction todo reassertion", () => {
 		emitHighUsageTurn(session);
 		const continuation = await continuationPromise;
 
-		expect(continuation.text).not.toContain("[completed]");
-		expect(continuation.text).not.toContain("[in_progress]");
-		expect(continuation.text).not.toContain("[blocked");
+		expect(continuation.reassertionText).toBeUndefined();
+	});
+
+	it("does not reassert when todo support is disabled", async () => {
+		const { session, sessionManager, waitForPostCompactionCall } = await createHarness({
+			"todo.enabled": false,
+		});
+		const continuation = await runToContinuationWithTodos(session, sessionManager, waitForPostCompactionCall, [
+			{
+				name: "Work",
+				tasks: [{ content: "finish the parser", status: "in_progress" }],
+			},
+		]);
+
+		expect(continuation.reassertionText).toBeUndefined();
+	});
+
+	it("does not reassert when the todo tool is not active", async () => {
+		const { session, sessionManager, waitForPostCompactionCall } = await createHarness();
+		activateOngoingGoal(session);
+		await session.prompt("refactor the parser across modules");
+		session.setActiveToolsByName(["bash"]);
+		appendUserTodoEdit(sessionManager, [
+			{
+				name: "Work",
+				tasks: [{ content: "finish the parser", status: "in_progress" }],
+			},
+		]);
+		const boundaryEntryId = sessionManager.appendCustomEntry("compaction-boundary-marker", {});
+		stubCompaction(boundaryEntryId);
+		const continuationPromise = waitForPostCompactionCall();
+		emitHighUsageTurn(session);
+		const continuation = await continuationPromise;
+
+		expect(continuation.reassertionText).toBeUndefined();
 	});
 
 	it("does not reassert when todo.reminders is disabled", async () => {
@@ -497,8 +707,33 @@ describe("AgentSession post-compaction todo reassertion", () => {
 			},
 		]);
 
-		expect(continuation.text).not.toContain("- finish the parser [in_progress]");
-		expect(continuation.text).not.toContain("- done thing [completed]");
+		expect(continuation.reassertionText).toBeUndefined();
+	});
+
+	it("reasserts blocked work even when no actionable task remains", async () => {
+		const { session, sessionManager, waitForPostCompactionCall } = await createHarness();
+		const continuation = await runToContinuationWithTodos(session, sessionManager, waitForPostCompactionCall, [
+			{
+				name: "Work",
+				tasks: [
+					{ content: "awaiting review", status: "blocked", blocker: "reviewer feedback" },
+					{ content: "done thing", status: "completed" },
+					{ content: "old approach", status: "abandoned" },
+				],
+			},
+		]);
+
+		for (const fragment of [
+			"awaiting review",
+			"blocked",
+			"reviewer feedback",
+			"done thing",
+			"completed",
+			"old approach",
+			"abandoned",
+		]) {
+			expect(continuation.reassertionText).toContain(fragment);
+		}
 	});
 
 	it("does not reassert when every task is complete", async () => {
@@ -507,7 +742,7 @@ describe("AgentSession post-compaction todo reassertion", () => {
 			{ name: "Work", tasks: [{ content: "done thing", status: "completed" }] },
 		]);
 
-		expect(continuation.text).not.toContain("- done thing [completed]");
+		expect(continuation.reassertionText).toBeUndefined();
 	});
 
 	it("does not reassert in plan mode", async () => {
@@ -524,6 +759,6 @@ describe("AgentSession post-compaction todo reassertion", () => {
 		emitHighUsageTurn(session);
 		const continuation = await continuationPromise;
 
-		expect(continuation.text).not.toContain("- finish the parser [in_progress]");
+		expect(continuation.reassertionText).toBeUndefined();
 	});
 });
