@@ -832,17 +832,30 @@ export class TurnRecovery {
 			const errorMessage = message.errorMessage || "Unknown error";
 			const parsedRetryAfterMs = this.#parseRetryAfterMsFromError(errorMessage);
 			const retryAfterMs = parsedRetryAfterMs ?? calculateRateLimitBackoffMs(parseRateLimitReason(errorMessage));
+			// Attribute the block to the model that actually returned the error,
+			// not the active selection: an in-flight run of the previous provider
+			// can settle with a usage-limit error after a fallback switch already
+			// moved the session, and marking the switched-in provider would block
+			// its healthy account for the failing provider's quota window (#17098).
+			// Origins that do not resolve in the registry (synthetic or removed
+			// models) keep the active selection, matching the previous behavior.
+			const failingModel =
+				message.provider !== undefined &&
+				(message.provider !== activeModel.provider || message.model !== activeModel.id)
+					? this.#host.modelRegistry.find(message.provider, message.model)
+					: undefined;
+			const attributed = failingModel ?? activeModel;
 			recorded = (async (): Promise<UsageLimitOutcome> => {
 				const outcome = await this.#host.modelRegistry.authStorage.limits.markReached(
-					activeModel.provider,
+					attributed.provider,
 					this.#host.sessionId(),
 					{
 						retryAfterMs,
 						// Provider-stated timing only when the error text parsed;
 						// the 30-minute fallback is a guess.
 						providerTimed: parsedRetryAfterMs !== undefined,
-						baseUrl: activeModel.baseUrl,
-						modelId: activeModel.id,
+						baseUrl: attributed.baseUrl,
+						modelId: attributed.id,
 					},
 				);
 				return {

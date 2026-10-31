@@ -382,6 +382,33 @@ describe("TurnRecovery replay-unsafe output classification", () => {
 		expect(recovery.isRetryableError(message)).toBe(false);
 	});
 
+	it("records a delayed usage limit against the provider that failed, not the switched-in fallback", async () => {
+		const codex = getBundledModel("openai-codex", "gpt-6.1-sol");
+		if (!codex) throw new Error("Expected bundled openai-codex model gpt-6.1-sol");
+		// The session already fell back to Anthropic when an in-flight Codex run
+		// settles with its usage-limit error (#17098): the block must land on the
+		// Codex credential that failed, not the healthy fallback provider.
+		const host = createHost(model, modelRegistry);
+		const recovery = new TurnRecovery(host);
+		const limits = authStorage.limits;
+		const markedProviders: string[] = [];
+		const originalMarkReached = limits.markReached;
+		limits.markReached = ((provider: string) => {
+			markedProviders.push(provider);
+			return Promise.resolve({ switched: false });
+		}) as typeof limits.markReached;
+		try {
+			const failed = {
+				...makeMessage([], codex),
+				errorMessage: "429 usage_limit_reached: You've reached your ChatGPT plan limit. Try again in ~9701 min.",
+			} as AssistantMessage;
+			await recovery.recordUsageLimitOutcome(failed);
+		} finally {
+			limits.markReached = originalMarkReached;
+		}
+		expect(markedProviders).toEqual(["openai-codex"]);
+	});
+
 	it("allows replay-safe hard fallback and excludes committed text with a configured chain", () => {
 		const fallbackChains = {
 			[`${model.provider}/${model.id}`]: ["openai/gpt-4o-mini"],
