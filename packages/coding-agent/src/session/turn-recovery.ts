@@ -373,6 +373,9 @@ type RetryPolicyOptions = {
 };
 
 type UsageLimitOutcome = {
+	/** The model the block was recorded against — the failing model, not necessarily the active one (#17098). */
+	attributedProvider: string;
+	attributedModelId: string;
 	switchedCredential: boolean;
 	retryAfterMs: number;
 	retryAtMs: number | undefined;
@@ -840,8 +843,7 @@ export class TurnRecovery {
 			// Origins that do not resolve in the registry (synthetic or removed
 			// models) keep the active selection, matching the previous behavior.
 			const failingModel =
-				message.provider !== undefined &&
-				(message.provider !== activeModel.provider || message.model !== activeModel.id)
+				message.provider !== activeModel.provider || message.model !== activeModel.id
 					? this.#host.modelRegistry.find(message.provider, message.model)
 					: undefined;
 			const attributed = failingModel ?? activeModel;
@@ -859,6 +861,8 @@ export class TurnRecovery {
 					},
 				);
 				return {
+					attributedProvider: attributed.provider,
+					attributedModelId: attributed.id,
 					switchedCredential: outcome.switched,
 					retryAfterMs,
 					retryAtMs: outcome.retryAtMs,
@@ -2696,8 +2700,26 @@ export class TurnRecovery {
 			(message.errorStatus === 429 || rateLimitReason === "RATE_LIMIT_EXCEEDED");
 		const staleOpenAIResponsesReplayError = AIError.is(id, AIError.Flag.StaleResponsesItem);
 		const accountPolicyDenial = AIError.is(id, AIError.Flag.AccountPolicy);
-		const recordedUsageLimitOutcome = await this.#usageLimitOutcomes.get(message);
-		const parsedRetryAfterMs = this.#parseRetryAfterMsFromError(errorMessage);
+		let recordedUsageLimitOutcome = await this.#usageLimitOutcomes.get(message);
+		let parsedRetryAfterMs = this.#parseRetryAfterMsFromError(errorMessage);
+		// #17098: an in-flight run of a previous provider settles after a
+		// fallback switch already moved the session. The outcome and the
+		// error text's timing describe the failing provider's accounts, so
+		// they must not redeem resets, wait out quota windows, or cool down
+		// selectors for the model now serving the session — that model is
+		// itself the recovery. Drop both, leaving the plain same-model
+		// backoff retry below; the block itself was already recorded against
+		// the failing provider by recordUsageLimitOutcome.
+		const retryPolicyModel = this.#host.model();
+		if (
+			recordedUsageLimitOutcome &&
+			retryPolicyModel &&
+			(recordedUsageLimitOutcome.attributedProvider !== retryPolicyModel.provider ||
+				recordedUsageLimitOutcome.attributedModelId !== retryPolicyModel.id)
+		) {
+			recordedUsageLimitOutcome = undefined;
+			parsedRetryAfterMs = undefined;
+		}
 		let delayMs = staleOpenAIResponsesReplayError
 			? 0
 			: calculateRetryBackoffDelayMs(retrySettings.baseDelayMs, this.#retryAttempt);

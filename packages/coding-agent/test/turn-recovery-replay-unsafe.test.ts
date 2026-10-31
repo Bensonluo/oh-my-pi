@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, it } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "bun:test";
 import type { AgentMessage, SyntheticToolResultDetails } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage, ToolResultMessage } from "@oh-my-pi/pi-ai";
 import * as AIError from "@oh-my-pi/pi-ai/error";
@@ -133,6 +133,10 @@ describe("TurnRecovery replay-unsafe output classification", () => {
 	afterAll(() => {
 		authStorage.close();
 		tempDir.removeSync();
+	});
+
+	afterEach(() => {
+		vi.restoreAllMocks();
 	});
 
 	it("rolls back a usage fallback cancelled during model reconciliation", async () => {
@@ -390,23 +394,63 @@ describe("TurnRecovery replay-unsafe output classification", () => {
 		// Codex credential that failed, not the healthy fallback provider.
 		const host = createHost(model, modelRegistry);
 		const recovery = new TurnRecovery(host);
-		const limits = authStorage.limits;
-		const markedProviders: string[] = [];
-		const originalMarkReached = limits.markReached;
-		limits.markReached = ((provider: string) => {
-			markedProviders.push(provider);
-			return Promise.resolve({ switched: false });
-		}) as typeof limits.markReached;
-		try {
-			const failed = {
-				...makeMessage([], codex),
-				errorMessage: "429 usage_limit_reached: You've reached your ChatGPT plan limit. Try again in ~9701 min.",
-			} as AssistantMessage;
-			await recovery.recordUsageLimitOutcome(failed);
-		} finally {
-			limits.markReached = originalMarkReached;
-		}
-		expect(markedProviders).toEqual(["openai-codex"]);
+		const markReached = vi.spyOn(authStorage.limits, "markReached").mockResolvedValue({ switched: false });
+		const failed: AssistantMessage = {
+			...makeMessage([], codex),
+			errorMessage: "429 usage_limit_reached: You've reached your ChatGPT plan limit. Try again in ~9701 min.",
+		};
+		await recovery.recordUsageLimitOutcome(failed);
+		expect(markReached).toHaveBeenCalledTimes(1);
+		// The whole attribution must describe the failing model, not the
+		// switched-in fallback: provider, modelId, and baseUrl all say codex.
+		expect(markReached).toHaveBeenCalledWith("openai-codex", "test-session", {
+			retryAfterMs: expect.any(Number),
+			providerTimed: true,
+			baseUrl: codex.baseUrl,
+			modelId: codex.id,
+		});
+	});
+
+	it("keeps a delayed foreign-provider usage limit out of the active model's retry policy", async () => {
+		const codex = getBundledModel("openai-codex", "gpt-6.1-sol");
+		if (!codex) throw new Error("Expected bundled openai-codex model gpt-6.1-sol");
+		// #17098: the session already fell back to Anthropic when the in-flight
+		// Codex run settles with its usage-limit error. The block is recorded
+		// against Codex; the retry policy for the healthy switched-in model must
+		// not spend that outcome — no reset redemption on the Anthropic account,
+		// no Codex quota-window wait on the retry, and no Codex-window cooldown
+		// on the Anthropic selector.
+		const host = createHost(model, modelRegistry);
+		const maybeAutoRedeemReset = vi.spyOn(host, "maybeAutoRedeemReset").mockResolvedValue({ restored: false });
+		const events: { type: string; delayMs?: number }[] = [];
+		host.emitSessionEvent = async event => {
+			events.push(
+				event.type === "auto_retry_start" ? { type: event.type, delayMs: event.delayMs } : { type: event.type },
+			);
+		};
+		const recovery = new TurnRecovery(host);
+		const noteCooldown = vi.spyOn(recovery, "noteRetryFallbackCooldown").mockImplementation(() => {});
+		vi.spyOn(authStorage.limits, "markReached").mockResolvedValue({ switched: false });
+		const failed: AssistantMessage = {
+			...makeMessage([], codex),
+			errorMessage: "429 usage_limit_reached: You've reached your ChatGPT plan limit. Try again in ~9701 min.",
+		};
+		// agent-session.ts records the outcome before the retry policy runs.
+		await recovery.recordUsageLimitOutcome(failed);
+
+		const retried = await recovery.handleRetryableError(failed);
+
+		expect(maybeAutoRedeemReset).not.toHaveBeenCalled();
+		expect(noteCooldown).toHaveBeenCalledTimes(1);
+		// No Codex quota window lands on the Anthropic selector: the cooldown
+		// falls back to the generic heuristic, not the stale provider's reset.
+		expect(noteCooldown.mock.calls[0]?.[1]).toBeUndefined();
+		const retryStart = events.find(event => event.type === "auto_retry_start");
+		expect(retried).toBe(true);
+		expect(retryStart).toBeDefined();
+		// The ~9701-minute Codex window must not hold back the healthy model:
+		// the generic backoff stays far below retry.maxDelayMs.
+		expect(retryStart?.delayMs ?? Number.POSITIVE_INFINITY).toBeLessThan(60_000);
 	});
 
 	it("allows replay-safe hard fallback and excludes committed text with a configured chain", () => {
