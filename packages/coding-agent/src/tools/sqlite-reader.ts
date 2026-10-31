@@ -782,13 +782,18 @@ export function queryRows(
 	const hasMore = fetched.length > opts.limit;
 	const rows = hasMore ? fetched.slice(0, opts.limit) : fetched;
 	const endsResultSet = !hasMore && (rows.length > 0 || opts.offset === 0);
-	return {
-		columns,
-		rows,
-		totalCount: endsResultSet
-			? { kind: "exact", rows: opts.offset + rows.length }
-			: probeRowCount(db, table, probeCap, whereClause),
-	};
+	const shown = opts.offset + rows.length;
+	let totalCount: TableRowCount = endsResultSet
+		? { kind: "exact", rows: shown }
+		: probeRowCount(db, table, probeCap, whereClause);
+	// The lookahead row proves at least one more row exists. When the shown rows
+	// have reached the probe's lower bound, that bound can no longer justify a
+	// continuation footer (the page would dead-end at the cap), so strengthen the
+	// bound to the lookahead fact — still a true lower bound, no extra scanning.
+	if (hasMore && totalCount.kind === "atLeast" && totalCount.rows <= shown) {
+		totalCount = { kind: "atLeast", rows: shown + 1 };
+	}
+	return { columns, rows, totalCount };
 }
 
 export function getRowByKey(

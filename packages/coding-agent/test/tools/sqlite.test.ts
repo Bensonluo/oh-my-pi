@@ -758,6 +758,33 @@ describe("SQLite paged row counts (#17535)", () => {
 		expect(page.totalCount).toEqual({ kind: "atLeast", rows: 3 });
 	});
 
+	it("keeps the footer when the page ends exactly at the probe cap and the lookahead row proves more rows", () => {
+		// 51 rows, probeCap 50: the page showing rows 46..50 (shown == cap) must
+		// still render a continuation footer — the limit+1 lookahead proves row 51
+		// exists, so the total strengthens to a lower bound of shown + 1.
+		const big = new Database(":memory:");
+		try {
+			big.run("CREATE TABLE cap_items (id INTEGER PRIMARY KEY)");
+			big.run(
+				"WITH RECURSIVE seq(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM seq WHERE i < 51) INSERT INTO cap_items SELECT i FROM seq",
+			);
+			const page = queryRows(big, "cap_items", { limit: 5, offset: 45, probeCap: 50 });
+			expect(page.totalCount).toEqual({ kind: "atLeast", rows: 51 });
+			const rendered = renderTable(page.columns, page.rows, {
+				totalCount: page.totalCount,
+				offset: 45,
+				limit: 5,
+				table: "cap_items",
+				dbPath: "cap_items.db",
+			});
+			expect(rendered).toContain(
+				"[1+ more rows; append :cap_items?limit=5&offset=50 to the database path to continue]",
+			);
+		} finally {
+			big.close();
+		}
+	});
+
 	it("renders a lower-bound footer for capped counts", () => {
 		const rendered = renderTable(["id"], [{ id: 1 }], {
 			totalCount: { kind: "atLeast", rows: 5 },
