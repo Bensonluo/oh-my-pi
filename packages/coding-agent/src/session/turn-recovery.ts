@@ -858,6 +858,12 @@ export class TurnRecovery {
 						providerTimed: parsedRetryAfterMs !== undefined,
 						baseUrl: attributed.baseUrl,
 						modelId: attributed.id,
+						// Park the block on the credential that actually served the
+						// failing request: a delayed settle can race a sibling
+						// rotation that already moved the provider's session
+						// affinity, and the affinity-resolved target would block a
+						// healthy credential for the failing account's window.
+						credentialId: message.credentialId,
 					},
 				);
 				return {
@@ -2710,13 +2716,17 @@ export class TurnRecovery {
 		// itself the recovery. Drop both, leaving the plain same-model
 		// backoff retry below; the block itself was already recorded against
 		// the failing provider by recordUsageLimitOutcome.
+		// Same-provider attribution is NOT stale: a different model ID on a
+		// shared quota scope (Anthropic's unscoped blocks, Codex's chat
+		// scope) still leaves the active model's pool covered by the block
+		// the mark installed, so the rotation/redemption signals stay valid
+		// for the active model and must not be discarded.
 		const retryPolicyModel = this.#host.model();
-		if (
-			recordedUsageLimitOutcome &&
-			retryPolicyModel &&
-			(recordedUsageLimitOutcome.attributedProvider !== retryPolicyModel.provider ||
-				recordedUsageLimitOutcome.attributedModelId !== retryPolicyModel.id)
-		) {
+		const staleCrossProviderOutcome =
+			recordedUsageLimitOutcome !== undefined &&
+			retryPolicyModel !== undefined &&
+			recordedUsageLimitOutcome.attributedProvider !== retryPolicyModel.provider;
+		if (staleCrossProviderOutcome) {
 			recordedUsageLimitOutcome = undefined;
 			parsedRetryAfterMs = undefined;
 		}
@@ -2986,6 +2996,12 @@ export class TurnRecovery {
 				allowModelFallback &&
 				retrySettings.modelFallback &&
 				retryFallbackAdmits(retrySettings.fallbackOn, AIError.is(id, AIError.Flag.UsageLimit)) &&
+				// A stale cross-provider usage limit is not a health signal for the
+				// active selector: walking the chain here cools down the healthy
+				// fallback with a generic heuristic window and swaps it away
+				// without ever trying it (#17098, #17571). The switch to the
+				// active model already IS the recovery — retry it plainly below.
+				!staleCrossProviderOutcome &&
 				!thinkingLoop &&
 				!sameModelSteerReplay &&
 				!waitForSiblingCredential &&

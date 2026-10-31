@@ -390,24 +390,29 @@ describe("TurnRecovery replay-unsafe output classification", () => {
 		const codex = getBundledModel("openai-codex", "gpt-6.1-sol");
 		if (!codex) throw new Error("Expected bundled openai-codex model gpt-6.1-sol");
 		// The session already fell back to Anthropic when an in-flight Codex run
-		// settles with its usage-limit error (#17098): the block must land on the
-		// Codex credential that failed, not the healthy fallback provider.
+		// settles with its usage-limit error (#17098): the block must land on
+		// the Codex credential that failed, not the healthy fallback provider.
 		const host = createHost(model, modelRegistry);
 		const recovery = new TurnRecovery(host);
 		const markReached = vi.spyOn(authStorage.limits, "markReached").mockResolvedValue({ switched: false });
 		const failed: AssistantMessage = {
 			...makeMessage([], codex),
 			errorMessage: "429 usage_limit_reached: You've reached your ChatGPT plan limit. Try again in ~9701 min.",
+			// The request resolved against this credential; the block must target
+			// it even if a sibling rotation already moved the session affinity.
+			credentialId: 42,
 		};
 		await recovery.recordUsageLimitOutcome(failed);
 		expect(markReached).toHaveBeenCalledTimes(1);
 		// The whole attribution must describe the failing model, not the
-		// switched-in fallback: provider, modelId, and baseUrl all say codex.
+		// switched-in fallback: provider, modelId, baseUrl, and the failing
+		// request's credential all say codex.
 		expect(markReached).toHaveBeenCalledWith("openai-codex", "test-session", {
 			retryAfterMs: expect.any(Number),
 			providerTimed: true,
 			baseUrl: codex.baseUrl,
 			modelId: codex.id,
+			credentialId: 42,
 		});
 	});
 
@@ -441,16 +446,59 @@ describe("TurnRecovery replay-unsafe output classification", () => {
 		const retried = await recovery.handleRetryableError(failed);
 
 		expect(maybeAutoRedeemReset).not.toHaveBeenCalled();
-		expect(noteCooldown).toHaveBeenCalledTimes(1);
-		// No Codex quota window lands on the Anthropic selector: the cooldown
-		// falls back to the generic heuristic, not the stale provider's reset.
-		expect(noteCooldown.mock.calls[0]?.[1]).toBeUndefined();
+		// The walk itself is bypassed for a stale cross-provider outcome: the
+		// active selector is healthy, so it gets neither a cooldown (not even
+		// the generic heuristic one) nor a fallback swap — the session just
+		// retries the active model plainly.
+		expect(noteCooldown).not.toHaveBeenCalled();
 		const retryStart = events.find(event => event.type === "auto_retry_start");
 		expect(retried).toBe(true);
 		expect(retryStart).toBeDefined();
 		// The ~9701-minute Codex window must not hold back the healthy model:
 		// the generic backoff stays far below retry.maxDelayMs.
 		expect(retryStart?.delayMs ?? Number.POSITIVE_INFINITY).toBeLessThan(60_000);
+	});
+
+	it("keeps a same-provider outcome for a sibling model on the shared quota pool", async () => {
+		const codexSol = getBundledModel("openai-codex", "gpt-6.1-sol");
+		const codexAstra = getBundledModel("openai-codex", "gpt-6-astra");
+		if (!codexSol || !codexAstra) throw new Error("Expected bundled openai-codex models gpt-6.1-sol and gpt-6-astra");
+		// Two non-Spark Codex models share the chat quota scope: a usage limit
+		// recorded against one covers the pool the active sibling also draws
+		// from, so the outcome is NOT stale — its rotation signal must still
+		// reach the retry policy for the active model.
+		const host = createHost(codexSol, modelRegistry);
+		const maybeAutoRedeemReset = vi.spyOn(host, "maybeAutoRedeemReset").mockResolvedValue({ restored: false });
+		const events: { type: string; delayMs?: number }[] = [];
+		host.emitSessionEvent = async event => {
+			events.push(
+				event.type === "auto_retry_start" ? { type: event.type, delayMs: event.delayMs } : { type: event.type },
+			);
+		};
+		const recovery = new TurnRecovery(host);
+		const noteCooldown = vi.spyOn(recovery, "noteRetryFallbackCooldown").mockImplementation(() => {});
+		// A sibling credential is free right now: markReached rotates to it.
+		vi.spyOn(authStorage.limits, "markReached").mockResolvedValue({ switched: true });
+		const failed: AssistantMessage = {
+			...makeMessage([], codexAstra),
+			errorMessage: "429 usage_limit_reached: You've reached your ChatGPT plan limit. Try again in ~9701 min.",
+		};
+		await recovery.recordUsageLimitOutcome(failed);
+
+		const retried = await recovery.handleRetryableError(failed);
+
+		// The outcome survived attribution to a sibling model: its rotation
+		// signal is consumed — retry proceeds at zero delay on the switched
+		// sibling instead of a generic backoff. (A dropped outcome would lose
+		// switchedCredential and fall back to a nonzero heuristic delay.)
+		expect(retried).toBe(true);
+		const retryStart = events.find(event => event.type === "auto_retry_start");
+		expect(retryStart).toBeDefined();
+		expect(retryStart?.delayMs).toBe(0);
+		// Rotation already moved the pool; no redeem walk and no selector
+		// cooldown are needed once the outcome's switch is honored.
+		expect(maybeAutoRedeemReset).not.toHaveBeenCalled();
+		expect(noteCooldown).not.toHaveBeenCalled();
 	});
 
 	it("allows replay-safe hard fallback and excludes committed text with a configured chain", () => {
